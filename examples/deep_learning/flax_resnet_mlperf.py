@@ -56,8 +56,8 @@ flags.DEFINE_float("momentum", 0.9, "Momentum strength.")
 flags.DEFINE_enum("dataset", "mnist", dataset_names, "Dataset to train on.")
 flags.DEFINE_enum("model", "resnet18", ["resnet1", "resnet18", "resnet34"],
                   "Model architecture.")
-flags.DEFINE_integer("train_batch_size", 256, "Batch size at train time.")
-flags.DEFINE_integer("test_batch_size", 1024, "Batch size at test time.")
+flags.DEFINE_integer("train_batch_size", 128, "Batch size at train time.")
+flags.DEFINE_integer("test_batch_size", 128, "Batch size at test time.")
 FLAGS = flags.FLAGS
 
 
@@ -233,6 +233,23 @@ def create_learning_rate_fn(
   return schedule_fn
 
 
+def create_cosine_schedule(base_lr, max_training_steps):
+  def lr_fn(t):
+    decay_factor = (1 + jnp.cos(t / max_training_steps * jnp.pi)) * 0.5
+    return base_lr * decay_factor
+  return lr_fn
+
+
+def load_train(dataset):
+  for batch in dataset.train_iterator_fn():
+    yield batch["inputs"], jnp.argmax(batch["targets"], axis=1)
+
+
+def load_test(dataset):
+  for batch in dataset.test_epoch():
+    yield batch["inputs"], jnp.argmax(batch["targets"], axis=1)
+
+
 def main(argv):
   del argv
 
@@ -240,12 +257,36 @@ def main(argv):
   # it unavailable to JAX.
   tf.config.experimental.set_visible_devices([], 'GPU')
 
+  from init2winit.dataset_lib import small_image_datasets
+  from ml_collections.config_dict import config_dict
+
+  augmented_dataset = small_image_datasets.get_cifar10(
+        jax.random.PRNGKey(0),
+        FLAGS.train_batch_size,
+        FLAGS.test_batch_size,
+        config_dict.ConfigDict(
+            dict(
+                flip_probability=0.5,
+                alpha=1.0,
+                crop_num_pixels=4,
+                use_mixup=False,
+                #train_size=45000,
+                #valid_size=5000,
+                train_size=50000,
+                valid_size=0,
+                test_size=10000,
+                include_example_keys=True,
+                input_shape=(32, 32, 3),
+                output_shape=(10,))))
+
   train_ds, ds_info = load_dataset("train", is_training=True,
                                    batch_size=FLAGS.train_batch_size)
-  test_ds, _ = load_dataset("test", is_training=False,
-                            batch_size=FLAGS.test_batch_size)
+  #test_ds, _ = load_dataset("test", is_training=False,
+                            #batch_size=FLAGS.test_batch_size)
+
   input_shape = (1,) + ds_info.features["image"].shape
   num_classes = ds_info.features["label"].num_classes
+
   iter_per_epoch = ds_info.splits['train'].num_examples // FLAGS.train_batch_size
   iter_per_epoch_test = ds_info.splits['test'].num_examples // FLAGS.test_batch_size
 
@@ -300,11 +341,16 @@ def main(argv):
     return loss, net_state["batch_stats"]
 
   # Initialize solver.
-  config = get_config()
-  base_learning_rate = config.learning_rate * FLAGS.train_batch_size / 256.
-  learning_rate_fn = create_learning_rate_fn(config=config,
-                                             base_learning_rate=base_learning_rate,
-                                             steps_per_epoch=iter_per_epoch)
+  #config = get_config()
+  #base_learning_rate = config.learning_rate * FLAGS.train_batch_size / 256.
+  #learning_rate_fn = create_learning_rate_fn(config=config,
+                                             #base_learning_rate=base_learning_rate,
+                                             #steps_per_epoch=iter_per_epoch)
+
+  train_size = 50000
+  num_train_steps = int(300. * train_size / FLAGS.train_batch_size)
+  learning_rate_fn = create_cosine_schedule(base_lr=0.1,
+                                            max_training_steps=num_train_steps)
 
   #opt = optax.sgd(learning_rate=FLAGS.learning_rate,
   opt = optax.sgd(learning_rate=learning_rate_fn,
@@ -325,6 +371,8 @@ def main(argv):
   state = solver.init_state(params)
   jitted_update = jax.jit(solver.update)
 
+  train_ds = load_train(augmented_dataset)
+
   for _ in range(solver.maxiter):
     train_minibatch = next(train_ds)
 
@@ -333,6 +381,9 @@ def main(argv):
       train_acc, train_loss = accuracy_and_loss(params, FLAGS.l2reg, train_minibatch, batch_stats)
       test_acc, test_loss = 0., 0.
       # make a pass over test set to compute test accuracy
+
+      test_ds = load_test(augmented_dataset)
+
       for _ in range(iter_per_epoch_test):
           tmp = accuracy_and_loss(params, FLAGS.l2reg, next(test_ds), batch_stats)
           test_acc += tmp[0] / iter_per_epoch_test
