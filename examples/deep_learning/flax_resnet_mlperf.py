@@ -17,12 +17,14 @@ Resnet example with Flax and JAXopt.
 ====================================
 """
 
+import functools
+
 from absl import app
 from absl import flags
 from datetime import datetime
 
 from functools import partial
-from typing import Any, Callable, Sequence, Tuple
+from typing import Any, Callable, Sequence, Tuple, Optional
 
 from flax import linen as nn
 
@@ -73,72 +75,125 @@ def load_dataset(split, *, is_training, batch_size):
   return iter(tfds.as_numpy(ds)), ds_info
 
 
-class ResNetBlock(nn.Module):
-  """ResNet block."""
+from init2winit.model_lib import normalization
+
+
+def _constant_init(factor):
+  def init_fn(key, shape, dtype=jnp.float32):
+    del key
+    return jnp.ones(shape, dtype) * factor
+  return init_fn
+
+
+class ResidualBlock(nn.Module):
+  """Bottleneck ResNet block."""
   filters: int
-  conv: Any
-  norm: Any
-  act: Callable
   strides: Tuple[int, int] = (1, 1)
+  axis_name: Optional[str] = None
+  axis_index_groups: Optional[Any] = None
+  dtype: Any = jnp.float32
+  batch_norm_momentum: float = 0.9
+  batch_norm_epsilon: float = 1e-5
+  bn_output_scale: float = 0.0
+  virtual_batch_size: Optional[int] = None
+  data_format: Optional[str] = None
 
   @nn.compact
-  def __call__(self, x,):
+  def __call__(self, x, train):
+    needs_projection = x.shape[-1] != self.filters * 4 or self.strides != (1, 1)
+    batch_norm = functools.partial(
+        normalization.VirtualBatchNorm,
+        momentum=self.batch_norm_momentum,
+        epsilon=self.batch_norm_epsilon,
+        axis_name=self.axis_name,
+        axis_index_groups=self.axis_index_groups,
+        dtype=self.dtype,
+        virtual_batch_size=self.virtual_batch_size,
+        data_format=self.data_format)
+    conv = functools.partial(nn.Conv, use_bias=False, dtype=self.dtype)
     residual = x
-    y = self.conv(self.filters, (3, 3), self.strides)(x)
-    y = self.norm()(y)
-    y = self.act(y)
-    y = self.conv(self.filters, (3, 3))(y)
-    y = self.norm(scale_init=nn.initializers.zeros)(y)
-
-    if residual.shape != y.shape:
-      residual = self.conv(self.filters, (1, 1),
-                           self.strides, name='conv_proj')(residual)
-      residual = self.norm(name='norm_proj')(residual)
-
-    return self.act(residual + y)
+    if needs_projection:
+      residual = conv(
+          self.filters * 4, (1, 1), self.strides, name='proj_conv')(residual)
+      residual = batch_norm(name='proj_bn')(
+          residual, use_running_average=not train)
+    y = conv(self.filters, (1, 1), name='conv1')(x)
+    y = batch_norm(name='bn1')(y, use_running_average=not train)
+    y = nn.relu(y)
+    y = conv(self.filters, (3, 3), self.strides, name='conv2')(y)
+    y = batch_norm(name='bn2')(y, use_running_average=not train)
+    y = nn.relu(y)
+    y = conv(self.filters * 4, (1, 1), name='conv3')(y)
+    y = batch_norm(
+        name='bn3', scale_init=_constant_init(self.bn_output_scale))(
+            y, use_running_average=not train)
+    y = nn.relu(residual + y)
+    return y
 
 
 class ResNet(nn.Module):
   """ResNetV1."""
-  stage_sizes: Sequence[int]
-  block_cls: Any
   num_classes: int
   num_filters: int = 64
+  num_layers: int = 50
+  axis_name: Optional[str] = None
+  axis_index_groups: Optional[Any] = None
   dtype: Any = jnp.float32
-  act: Callable = nn.relu
+  batch_norm_momentum: float = 0.9
+  batch_norm_epsilon: float = 1e-5
+  bn_output_scale: float = 0.0
+  virtual_batch_size: Optional[int] = None
+  data_format: Optional[str] = None
 
   @nn.compact
-  def __call__(self, x, train: bool = True):
-    conv = partial(nn.Conv, use_bias=False, dtype=self.dtype)
-    norm = partial(nn.BatchNorm,
-                   use_running_average=not train,
-                   momentum=0.9,
-                   epsilon=1e-5,
-                   dtype=self.dtype)
-
-    x = conv(self.num_filters, (7, 7), (2, 2),
-             padding=[(3, 3), (3, 3)],
-             name='conv_init')(x)
-    x = norm(name='bn_init')(x)
-    x = nn.relu(x)
+  def __call__(self, x, train):
+    if self.num_layers not in _block_size_options:
+      raise ValueError('Please provide a valid number of layers')
+    block_sizes = _block_size_options[self.num_layers]
+    conv = functools.partial(nn.Conv, padding=[(3, 3), (3, 3)])
+    x = conv(self.num_filters, kernel_size=(7, 7), strides=(2, 2),
+             use_bias=False, dtype=self.dtype, name='conv0')(x)
+    x = normalization.VirtualBatchNorm(
+        momentum=self.batch_norm_momentum,
+        epsilon=self.batch_norm_epsilon,
+        name='init_bn',
+        axis_name=self.axis_name,
+        axis_index_groups=self.axis_index_groups,
+        dtype=self.dtype,
+        virtual_batch_size=self.virtual_batch_size,
+        data_format=self.data_format)(x, use_running_average=not train)
+    x = nn.relu(x)  # MLPerf-required
     x = nn.max_pool(x, (3, 3), strides=(2, 2), padding='SAME')
-    for i, block_size in enumerate(self.stage_sizes):
+    for i, block_size in enumerate(block_sizes):
       for j in range(block_size):
         strides = (2, 2) if i > 0 and j == 0 else (1, 1)
-        x = self.block_cls(self.num_filters * 2 ** i,
-                           strides=strides,
-                           conv=conv,
-                           norm=norm,
-                           act=self.act)(x)
+        x = ResidualBlock(
+            self.num_filters * 2 ** i,
+            strides=strides,
+            axis_name=self.axis_name,
+            axis_index_groups=self.axis_index_groups,
+            dtype=self.dtype,
+            batch_norm_momentum=self.batch_norm_momentum,
+            batch_norm_epsilon=self.batch_norm_epsilon,
+            bn_output_scale=self.bn_output_scale,
+            virtual_batch_size=self.virtual_batch_size,
+            data_format=self.data_format)(x, train=train)
     x = jnp.mean(x, axis=(1, 2))
-    x = nn.Dense(self.num_classes, dtype=self.dtype)(x)
-    x = jnp.asarray(x, self.dtype)
+    x = nn.Dense(self.num_classes, kernel_init=nn.initializers.normal(),
+                 dtype=self.dtype)(x)
     return x
 
-
-ResNet1 = partial(ResNet, stage_sizes=[1], block_cls=ResNetBlock)
-ResNet18 = partial(ResNet, stage_sizes=[2, 2, 2, 2], block_cls=ResNetBlock)
-ResNet34 = partial(ResNet, stage_sizes=[3, 4, 6, 3], block_cls=ResNetBlock)
+# a dictionary mapping the number of layers in a resnet to the number of blocks
+# in each stage of the model.
+_block_size_options = {
+    1: [1],
+    18: [2, 2, 2, 2],
+    34: [3, 4, 6, 3],
+    50: [3, 4, 6, 3],
+    101: [3, 4, 23, 3],
+    152: [3, 8, 36, 3],
+    200: [3, 24, 36, 3]
+}
 
 
 def get_config():
@@ -195,14 +250,6 @@ def main(argv):
   iter_per_epoch_test = ds_info.splits['test'].num_examples // FLAGS.test_batch_size
 
   # Set up model.
-  if FLAGS.model == "resnet1":
-    net = ResNet1(num_classes=num_classes)
-  elif FLAGS.model == "resnet18":
-    net = ResNet18(num_classes=num_classes)
-  elif FLAGS.model == "resnet34":
-    net = ResNet34(num_classes=num_classes)
-  else:
-    raise ValueError("Unknown model.")
 
   def predict(params, inputs, aux, train=False):
     x = inputs.astype(jnp.float32) / 255.
@@ -215,6 +262,23 @@ def main(argv):
       return net.apply(all_params, x, train=False)
 
   logistic_loss = jax.vmap(loss.multiclass_logistic_loss)
+
+  num_filters = 16
+  batch_norm_momentum = 0.9
+  batch_norm_epsilon = 1e-5
+  bn_output_scale = 0.0
+  num_layers = 18 # 1, 18, 34, 50, 101, 152, 200
+  virtual_batch_size = 64
+  data_format = "NHWC"
+
+  net = ResNet(
+        num_classes=num_classes,
+        num_filters=num_filters,
+        num_layers=num_layers,
+        batch_norm_momentum=batch_norm_momentum,
+        batch_norm_epsilon=batch_norm_epsilon,
+        bn_output_scale=bn_output_scale,
+        data_format=data_format)
 
   def loss_from_logits(params, l2reg, logits, labels):
     mean_loss = jnp.mean(logistic_loss(labels, logits))
@@ -245,7 +309,7 @@ def main(argv):
   #opt = optax.sgd(learning_rate=FLAGS.learning_rate,
   opt = optax.sgd(learning_rate=learning_rate_fn,
                   momentum=FLAGS.momentum,
-                  nesterov=True)
+                  nesterov=False)
 
   # We need has_aux=True because loss_fun returns batch_stats.
   solver = OptaxSolver(opt=opt, fun=loss_fun, maxiter=FLAGS.epochs * iter_per_epoch, has_aux=True)
