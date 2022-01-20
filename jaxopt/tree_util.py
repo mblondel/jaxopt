@@ -24,3 +24,4 @@ from jaxopt._src.tree_util import tree_vdot
 from jaxopt._src.tree_util import tree_sum
 from jaxopt._src.tree_util import tree_l2_norm
 from jaxopt._src.tree_util import tree_zeros_like
+from jaxopt._src.tree_util import tree_where

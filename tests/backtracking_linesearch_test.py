@@ -32,8 +32,8 @@ class BacktrackingLinesearchTest(jtu.JaxTestCase):
 
   @parameterized.product(cond=["strong-wolfe", "wolfe"])
   def test_backtracking_linesearch(self, cond):
-    X, y = datasets.make_classification(n_samples=10, n_features=5, n_classes=2,
-                                        n_informative=3, random_state=0)
+    X, y = datasets.load_digits(return_X_y=True)
+    y = jnp.where(y >= 1, 1, 0)
     data = (X, y)
     fun = objective.binary_logreg
 
